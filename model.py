@@ -7,7 +7,7 @@ International Conference for Machine Learning (2015)
 http://arxiv.org/abs/1502.03044
 
 Comments in square brackets [] indicate references to the equations/
-more detailed explanations in the above paper. 
+more detailed explanations in the above paper.
 '''
 import theano
 import theano.tensor as tensor
@@ -395,7 +395,7 @@ def lstm_cond_layer(tparams, state_below, options, prefix='lstm',
     def _step(m_, x_, h_, c_, a_, as_, ct_, pctx_, dp_=None, dp_att_=None):
         """ Each variable is one time slice of the LSTM
         m_ - (mask), x_- (previous word), h_- (hidden state), c_- (lstm memory),
-        a_ - (alpha distribution [eq (5)]), as_- (sample from alpha dist), ct_- (context), 
+        a_ - (alpha distribution [eq (5)]), as_- (sample from alpha dist), ct_- (context),
         pctx_ (projected context), dp_/dp_att_ (dropout masks)
         """
         # attention computation
@@ -454,7 +454,7 @@ def lstm_cond_layer(tparams, state_below, options, prefix='lstm',
         # compute the new memory/hidden state
         # if the mask is 0, just copy the previous state
         c = f * c_ + i * c
-        c = m_[:,None] * c + (1. - m_)[:,None] * c_ 
+        c = m_[:,None] * c + (1. - m_)[:,None] * c_
 
         h = o * tensor.tanh(c)
         h = m_[:,None] * h + (1. - m_)[:,None] * h_
@@ -719,7 +719,7 @@ def build_model(tparams, options, sampling=True):
     cost = (masked_cost).sum(0)
 
     # optional outputs
-    opt_outs = dict() 
+    opt_outs = dict()
     if options['selector']:
         opt_outs['selector'] = sels
     if options['attn_type'] == 'stochastic':
@@ -841,8 +841,11 @@ def build_sampler(tparams, options, use_noise, trng, sampling=True):
 
     return f_init, f_next
 
+
+################################################################################
+
 # generate sample
-def gen_sample(tparams, f_init, f_next, ctx0, options,
+def emiel_gen_sample(tparams, f_init, f_next, ctx0, options, word_idict,
                trng=None, k=1, maxlen=30, stochastic=False):
     """Generate captions with beam search.
     
@@ -856,7 +859,7 @@ def gen_sample(tparams, f_init, f_next, ctx0, options,
         dictionary of theano shared variables represented weight
         matricies
     f_init : theano function
-        input: annotation, output: initial lstm state and memory 
+        input: annotation, output: initial lstm state and memory
         (also performs transformation on ctx0 if using lstm_encoder)
     f_next: theano function
         takes the previous word/state/memory + ctx0 and runs one
@@ -872,12 +875,12 @@ def gen_sample(tparams, f_init, f_next, ctx0, options,
     maxlen : int
         maximum allowed caption size
     stochastic : bool
-        if True, sample stochastically 
+        if True, sample stochastically
 
     Returns
     -------
     sample : list of list
-        each sublist contains an (encoded) sample from the model 
+        each sublist contains an (encoded) sample from the model
     sample_score : numpy array
         scores of each sample
     """
@@ -910,7 +913,182 @@ def gen_sample(tparams, f_init, f_next, ctx0, options,
         next_memory.append(rval[1+options['n_layers_lstm']+lidx])
         next_memory[-1] = next_memory[-1].reshape([1, next_memory[-1].shape[0]])
     # reminder: if next_w = -1, the switch statement
-    # in build_sampler is triggered -> (empty word embeddings)  
+    # in build_sampler is triggered -> (empty word embeddings)
+    next_w = -1 * numpy.ones((1,)).astype('int64')
+
+    for ii in xrange(maxlen):
+        # our "next" state/memory in our previous step is now our "initial" state and memory
+        rval = f_next(*([next_w, ctx0]+next_state+next_memory))
+        next_p = rval[0]
+        next_w = rval[1]
+
+        # extract all the states and memories
+        next_state = []
+        next_memory = []
+        for lidx in xrange(options['n_layers_lstm']):
+            next_state.append(rval[2+lidx])
+            next_memory.append(rval[2+options['n_layers_lstm']+lidx])
+
+        if stochastic:
+            word_index = next_w[0]
+            sample.append(word_index) # if we are using stochastic sampling this easy
+            print [word_idict[i] for i in sample]
+            sample_score += next_p[0,word_index]
+            if word_index == 0:
+                break
+        else:
+            cand_scores = hyp_scores[:,None] - numpy.log(next_p)
+            cand_flat = cand_scores.flatten()
+            ranks_flat = cand_flat.argsort()[:(k-dead_k)] # (k-dead_k) numpy array of with min nll
+
+            voc_size = next_p.shape[1]
+            # indexing into the correct selected captions
+            trans_indices = ranks_flat / voc_size
+            word_indices = ranks_flat % voc_size
+            costs = cand_flat[ranks_flat] # extract costs from top hypothesis
+
+            # a bunch of lists to hold future hypothesis
+            new_hyp_samples = []
+            new_hyp_scores = numpy.zeros(k-dead_k).astype('float32')
+            new_hyp_states = []
+            for lidx in xrange(options['n_layers_lstm']):
+                new_hyp_states.append([])
+            new_hyp_memories = []
+            for lidx in xrange(options['n_layers_lstm']):
+                new_hyp_memories.append([])
+
+            # get the corresponding hypothesis and append the predicted word
+            for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
+                current_beam = hyp_samples[ti]+[wi]
+                new_hyp_samples.append(current_beam)
+                print 'Beam %d:' % idx, [word_idict[i] for i in current_beam], 'Adding:', word_idict[wi]
+                new_hyp_scores[idx] = copy.copy(costs[idx]) # copy in the cost of that hypothesis
+                for lidx in xrange(options['n_layers_lstm']):
+                    new_hyp_states[lidx].append(copy.copy(next_state[lidx][ti]))
+                for lidx in xrange(options['n_layers_lstm']):
+                    new_hyp_memories[lidx].append(copy.copy(next_memory[lidx][ti]))
+
+            # check the finished samples for <eos> character
+            new_live_k = 0
+            hyp_samples = []
+            hyp_scores = []
+            hyp_states = []
+            for lidx in xrange(options['n_layers_lstm']):
+                hyp_states.append([])
+            hyp_memories = []
+            for lidx in xrange(options['n_layers_lstm']):
+                hyp_memories.append([])
+
+            for idx in xrange(len(new_hyp_samples)):
+                if new_hyp_samples[idx][-1] == 0:
+                    sample.append(new_hyp_samples[idx])
+                    sample_score.append(new_hyp_scores[idx])
+                    dead_k += 1 # completed sample!
+                else:
+                    new_live_k += 1 # collect collect correct states/memories
+                    hyp_samples.append(new_hyp_samples[idx])
+                    hyp_scores.append(new_hyp_scores[idx])
+                    for lidx in xrange(options['n_layers_lstm']):
+                        hyp_states[lidx].append(new_hyp_states[lidx][idx])
+                    for lidx in xrange(options['n_layers_lstm']):
+                        hyp_memories[lidx].append(new_hyp_memories[lidx][idx])
+            hyp_scores = numpy.array(hyp_scores)
+            live_k = new_live_k
+
+            if new_live_k < 1:
+                break
+            if dead_k >= k:
+                break
+
+            next_w = numpy.array([w[-1] for w in hyp_samples])
+            next_state = []
+            for lidx in xrange(options['n_layers_lstm']):
+                next_state.append(numpy.array(hyp_states[lidx]))
+            next_memory = []
+            for lidx in xrange(options['n_layers_lstm']):
+                next_memory.append(numpy.array(hyp_memories[lidx]))
+
+    if not stochastic:
+        # dump every remaining one
+        if live_k > 0:
+            for idx in xrange(live_k):
+                sample.append(hyp_samples[idx])
+                sample_score.append(hyp_scores[idx])
+
+    return sample, sample_score
+
+################################################################################
+
+# generate sample
+def gen_sample(tparams, f_init, f_next, ctx0, options,
+               trng=None, k=1, maxlen=30, stochastic=False):
+    """Generate captions with beam search.
+    
+    This function uses the beam search algorithm to conditionally
+    generate candidate captions. Supports beamsearch and stochastic
+    sampling.
+
+    Parameters
+    ----------
+    tparams : OrderedDict()
+        dictionary of theano shared variables represented weight
+        matricies
+    f_init : theano function
+        input: annotation, output: initial lstm state and memory
+        (also performs transformation on ctx0 if using lstm_encoder)
+    f_next: theano function
+        takes the previous word/state/memory + ctx0 and runs one
+        step through the lstm
+    ctx0 : numpy array
+        annotation from convnet, of dimension #annotations x # dimension
+        [e.g (196 x 512)]
+    options : dict
+        dictionary of flags and options
+    trng : random number generator
+    k : int
+        size of beam search
+    maxlen : int
+        maximum allowed caption size
+    stochastic : bool
+        if True, sample stochastically
+
+    Returns
+    -------
+    sample : list of list
+        each sublist contains an (encoded) sample from the model
+    sample_score : numpy array
+        scores of each sample
+    """
+    if k > 1:
+        assert not stochastic, 'Beam search does not support stochastic sampling'
+
+    sample = []
+    sample_score = []
+    if stochastic:
+        sample_score = 0
+
+    live_k = 1
+    dead_k = 0
+
+    hyp_samples = [[]] * live_k
+    hyp_scores = numpy.zeros(live_k).astype('float32')
+    hyp_states = []
+    hyp_memories = []
+
+    # only matters if we use lstm encoder
+    rval = f_init(ctx0)
+    ctx0 = rval[0]
+    next_state = []
+    next_memory = []
+    # the states are returned as a: (dim,) and this is just a reshape to (1, dim)
+    for lidx in xrange(options['n_layers_lstm']):
+        next_state.append(rval[1+lidx])
+        next_state[-1] = next_state[-1].reshape([1, next_state[-1].shape[0]])
+    for lidx in xrange(options['n_layers_lstm']):
+        next_memory.append(rval[1+options['n_layers_lstm']+lidx])
+        next_memory[-1] = next_memory[-1].reshape([1, next_memory[-1].shape[0]])
+    # reminder: if next_w = -1, the switch statement
+    # in build_sampler is triggered -> (empty word embeddings)
     next_w = -1 * numpy.ones((1,)).astype('int64')
 
     for ii in xrange(maxlen):
@@ -932,7 +1110,7 @@ def gen_sample(tparams, f_init, f_next, ctx0, options,
             if next_w[0] == 0:
                 break
         else:
-            cand_scores = hyp_scores[:,None] - numpy.log(next_p) 
+            cand_scores = hyp_scores[:,None] - numpy.log(next_p)
             cand_flat = cand_scores.flatten()
             ranks_flat = cand_flat.argsort()[:(k-dead_k)] # (k-dead_k) numpy array of with min nll
 
@@ -955,7 +1133,7 @@ def gen_sample(tparams, f_init, f_next, ctx0, options,
             # get the corresponding hypothesis and append the predicted word
             for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
                 new_hyp_samples.append(hyp_samples[ti]+[wi])
-                new_hyp_scores[idx] = copy.copy(costs[idx]) # copy in the cost of that hypothesis 
+                new_hyp_scores[idx] = copy.copy(costs[idx]) # copy in the cost of that hypothesis
                 for lidx in xrange(options['n_layers_lstm']):
                     new_hyp_states[lidx].append(copy.copy(next_state[lidx][ti]))
                 for lidx in xrange(options['n_layers_lstm']):
@@ -1383,7 +1561,7 @@ def train(dim_word=100,  # word vector dimensionality
                     valid_err = -pred_probs(f_log_probs, model_options, worddict, prepare_data, valid, kf_valid).mean()
                     print 'Epoch ', eidx, ' Update ', uidx,  ' Valid Cost ', valid_err
 
-                    # the model with the best validation long likelihood is saved 
+                    # the model with the best validation long likelihood is saved
                     # we save each set of parameters that reduced the cost with the
                     # validation cost at the end of the filename
                     if valid_err <= best_err:
@@ -1496,7 +1674,7 @@ def train(dim_word=100,  # word vector dimensionality
                 print('Saving model to %s' % saveto)
                 numpy.savez(saveto, history_errs=history_errs, **params)
                 best_metric = m_score
-        # the model with the best validation long likelihood is saved 
+        # the model with the best validation long likelihood is saved
         # we save each set of parameters that reduced the cost with the
         # validation cost at the end of the filename
         elif valid_err <= best_err:
