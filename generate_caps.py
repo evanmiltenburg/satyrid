@@ -6,12 +6,16 @@ Works on CPU with support for multi-process
 import argparse
 import numpy
 import cPickle as pkl
+import sys
 
 from model import build_sampler, gen_sample, \
                    load_params, \
                    init_params, \
                    init_tparams, \
-                   get_dataset \
+                   get_dataset, \
+                   build_model, \
+                   inspect_pred_probs
+
 
 from multiprocessing import Process, Queue
 from collections import deque
@@ -62,6 +66,36 @@ def gen_model(queue, rqueue, pid, model, options, k, normalize, word_idict, samp
 
     return 
 
+def prob_model(model, options, prepare_data, data, worddict, word_idict):
+    import theano
+    from theano import tensor
+    from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
+
+    trng = RandomStreams(1234)
+    # this is zero indicate we are not using dropout in the graph
+    use_noise = theano.shared(numpy.float32(0.), name='use_noise')
+
+    # get the parameters
+    params = init_params(options)
+    params = load_params(model, params)
+    tparams = init_tparams(params)
+
+    # build the full model to inspect the probability of the sequence
+    print("Starting to build the model ...")
+    trng, use_noise, \
+          inps, alphas, alphas_sample,\
+          cost, \
+          opt_outs, complete_cost = \
+          build_model(tparams, options)
+    # we want the cost without any the regularizers
+    f_log_probs = theano.function(inps, -complete_cost, profile=False,
+                                        updates=opt_outs['attn_updates']
+                                        if options['attn_type']=='stochastic'
+                                        else None)
+    valid_err = -inspect_pred_probs(f_log_probs, options, worddict,
+                                    prepare_data, data,
+                                    word_idict, verbose=True)
+
 def main(model, saveto, k=5, normalize=False, zero_pad=False, n_process=5,
          splits='dev,test', sampling=False, pkl_name=None, dataset=None):
     # load model model_options
@@ -82,6 +116,9 @@ def main(model, saveto, k=5, normalize=False, zero_pad=False, n_process=5,
         word_idict[vv] = kk
     word_idict[0] = '<eos>'
     word_idict[1] = 'UNK'
+    
+    prob_model(model, options, prepare_data, valid, worddict, word_idict)
+
 
     # create processes
     print "Creating processes ..."
