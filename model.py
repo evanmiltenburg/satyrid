@@ -609,6 +609,8 @@ def build_model(tparams, options, sampling=True):
         negative log likelihood
     opt_outs: OrderedDict
         extra outputs required depending on configuration in options
+    complete_cost: theano variable
+        complete sequence of log likelihoods (to inspect the sequences)        
     """
     trng = RandomStreams(1234)
     use_noise = theano.shared(numpy.float32(0.))
@@ -716,6 +718,7 @@ def build_model(tparams, options, sampling=True):
     cost = -tensor.log(p_flat[tensor.arange(x_flat.shape[0])*probs.shape[1]+x_flat]+1e-8)
     cost = cost.reshape([x.shape[0], x.shape[1]])
     masked_cost = cost * mask
+    complete_cost = masked_cost
     cost = (masked_cost).sum(0)
 
     # optional outputs
@@ -726,7 +729,7 @@ def build_model(tparams, options, sampling=True):
         opt_outs['masked_cost'] = masked_cost # need this for reinforce later
         opt_outs['attn_updates'] = attn_updates # this is to update the rng
 
-    return trng, use_noise, [x, mask, ctx], alphas, alpha_sample, cost, opt_outs
+    return trng, use_noise, [x, mask, ctx], alphas, alpha_sample, cost, opt_outs, complete_cost
 
 # build a sampler
 def build_sampler(tparams, options, use_noise, trng, sampling=True):
@@ -1231,6 +1234,54 @@ def pred_probs(f_log_probs, options, worddict, prepare_data, data, iterator, ver
 
     return probs
 
+def inspect_pred_probs(f_log_probs, options, worddict, prepare_data, data,
+                       word_idict, target_token="blue", verbose=False):
+    """ Inspect the log probabilities of the entire sequence for a caption
+    Parameters
+    ----------
+    f_log_probs : theano function
+        compute the log probability of a x given the context
+    options : dict
+        options dictionary
+    worddict : dict
+        maps words to one-hot encodings
+    prepare_data : function
+        see corresponding dataset class for details
+    data : numpy array
+        output of load_data, see corresponding dataset class
+    word_idict : dict
+        maps one-hot encodings to words
+    target_token : str
+        the word for which you want to inspect the log probability
+    verbose : boolean
+        if True print probability of the sequence and of the target_token
+    Returns
+    -------
+    probs : numpy array
+        array of log probabilities indexed by example
+    """
+    n_samples = len(data[0])
+    probs = []
+
+    n_done = 0
+
+    for valid_index in range(len(data[0])):
+        x, mask, ctx = prepare_data([data[0][valid_index]],
+                                     data[1],
+                                     worddict,
+                                     maxlen=None,
+                                     n_words=options['n_words'])
+        pred_probs = f_log_probs(x,mask,ctx)
+        if verbose:
+            for widx, prob in zip(x.flatten().tolist(), pred_probs.flatten().tolist()):
+                if word_idict[widx] == target_token:
+                    print(' '.join([word_idict[z] for z in x.flatten().tolist()]))
+                    print([y for y in pred_probs.flatten().tolist()])
+                    print('%s %f' % (word_idict[widx], -prob)) #-ve puts us into +ve space
+        probs.append(pred_probs[:,None])
+
+    return probs
+
 def validate_options(options):
     # Put friendly reminders here
     if options['dim_word'] > options['dim']:
@@ -1409,7 +1460,8 @@ def train(dim_word=100,  # word vector dimensionality
     trng, use_noise, \
           inps, alphas, alphas_sample,\
           cost, \
-          opt_outs = \
+          opt_outs,  \
+          complete_cost = \
           build_model(tparams, model_options)
 
 
